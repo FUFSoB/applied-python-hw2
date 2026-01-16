@@ -2,8 +2,15 @@ import asyncio
 import logging
 import os
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+import io
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 warnings.filterwarnings("ignore", message=".*protected namespace.*")
 
@@ -16,7 +23,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, Message
+from aiogram.types import BotCommand, BufferedInputFile, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -112,6 +119,21 @@ async def init_db():
             )
         """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                water_logged INTEGER DEFAULT 0,
+                water_goal INTEGER DEFAULT 2000,
+                calories_logged REAL DEFAULT 0,
+                calories_burned REAL DEFAULT 0,
+                calorie_goal INTEGER DEFAULT 2000,
+                UNIQUE(user_id, date)
+            )
+        """
+        )
         await db.commit()
 
 
@@ -202,6 +224,159 @@ def is_profile_complete(user_data: dict) -> bool:
             user_data.get("city"),
         ]
     )
+
+
+async def save_daily_history(user_id: int, user_data: dict):
+    today = datetime.now().date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO history (user_id, date, water_logged, water_goal,
+                                calories_logged, calories_burned, calorie_goal)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, date) DO UPDATE SET
+                water_logged = excluded.water_logged,
+                water_goal = excluded.water_goal,
+                calories_logged = excluded.calories_logged,
+                calories_burned = excluded.calories_burned,
+                calorie_goal = excluded.calorie_goal
+            """,
+            (
+                user_id,
+                today,
+                user_data.get("logged_water", 0),
+                user_data.get("water_goal", 2000),
+                user_data.get("logged_calories", 0),
+                user_data.get("burned_calories", 0),
+                user_data.get("calorie_goal", 2000),
+            ),
+        )
+        await db.commit()
+
+
+async def get_history(user_id: int, days: int = 7) -> list[dict]:
+    start_date = (datetime.now() - timedelta(days=days - 1)).date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM history
+            WHERE user_id = ? AND date >= ?
+            ORDER BY date ASC
+            """,
+            (user_id, start_date),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def generate_progress_chart(user_id: int, days: int = 7) -> Optional[bytes]:
+    history = await get_history(user_id, days)
+    if not history:
+        return None
+
+    dates = [datetime.fromisoformat(h["date"]) for h in history]
+    water_logged = [h["water_logged"] for h in history]
+    water_goals = [h["water_goal"] for h in history]
+    calories_logged = [h["calories_logged"] for h in history]
+    calories_burned = [h["calories_burned"] for h in history]
+    calorie_goals = [h["calorie_goal"] for h in history]
+    calorie_balance = [
+        logged - burned for logged, burned in zip(calories_logged, calories_burned)
+    ]
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), dpi=100)
+    fig.suptitle("Прогресс за последние дни", fontsize=14, fontweight="bold")
+
+    ax1 = axes[0]
+    ax1.fill_between(dates, water_logged, alpha=0.3, color="#2196F3")
+    ax1.plot(
+        dates,
+        water_logged,
+        "o-",
+        color="#2196F3",
+        linewidth=2,
+        markersize=8,
+        label="Выпито",
+    )
+    ax1.plot(dates, water_goals, "--", color="#4CAF50", linewidth=2, label="Цель")
+    ax1.set_ylabel("Вода (мл)", fontsize=11)
+    ax1.set_title("Потребление воды", fontsize=12, pad=10)
+    ax1.legend(loc="upper left")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    ax1.xaxis.set_major_locator(mdates.DayLocator())
+
+    for i, (d, w, g) in enumerate(zip(dates, water_logged, water_goals)):
+        percent = min(100, int(w / g * 100)) if g > 0 else 0
+        color = (
+            "#4CAF50" if percent >= 100 else "#FF9800" if percent >= 50 else "#F44336"
+        )
+        ax1.annotate(
+            f"{percent}%",
+            (d, w),
+            textcoords="offset points",
+            xytext=(0, 10),
+            ha="center",
+            fontsize=9,
+            color=color,
+            fontweight="bold",
+        )
+
+    ax2 = axes[1]
+    bar_width = 0.35
+    x_indices = range(len(dates))
+
+    ax2.bar(
+        [i - bar_width / 2 for i in x_indices],
+        calories_logged,
+        bar_width,
+        label="Потреблено",
+        color="#FF5722",
+        alpha=0.8,
+    )
+    ax2.bar(
+        [i + bar_width / 2 for i in x_indices],
+        calories_burned,
+        bar_width,
+        label="Сожжено",
+        color="#4CAF50",
+        alpha=0.8,
+    )
+    ax2.plot(
+        x_indices,
+        calorie_goals,
+        "D--",
+        color="#9C27B0",
+        linewidth=2,
+        markersize=6,
+        label="Цель",
+    )
+    ax2.set_ylabel("Калории (ккал)", fontsize=11)
+    ax2.set_title("Калории", fontsize=12, pad=10)
+    ax2.set_xticks(x_indices)
+    ax2.set_xticklabels([d.strftime("%d.%m") for d in dates])
+    ax2.legend(loc="upper left")
+
+    for i, (bal, goal) in enumerate(zip(calorie_balance, calorie_goals)):
+        color = "#4CAF50" if bal <= goal else "#F44336"
+        ax2.annotate(
+            f"{bal:.0f}",
+            (i, max(calories_logged[i], calories_burned[i])),
+            textcoords="offset points",
+            xytext=(0, 10),
+            ha="center",
+            fontsize=9,
+            color=color,
+            fontweight="bold",
+        )
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
 
 
 def calculate_water_goal(
@@ -336,6 +511,7 @@ async def cmd_start(message: Message):
 /log\\_food <продукт> - записать еду
 /log\\_workout <тип> <мин> - записать тренировку
 /check\\_progress - прогресс
+/plot - графики прогресса
 /recommend - советы
 
 Чтобы начать, задайте ваш профиль: /set\\_profile""",
@@ -518,6 +694,8 @@ async def cmd_log_water(message: Message):
 
     new_water = user_data["logged_water"] + amount
     await update_user_data(user_id, logged_water=new_water)
+    user_data["logged_water"] = new_water
+    await save_daily_history(user_id, user_data)
 
     remaining = max(0, user_data["water_goal"] - new_water)
     status = "Норма выполнена!" if remaining == 0 else f"Осталось: {remaining} мл"
@@ -589,6 +767,8 @@ async def process_food_grams(message: Message, state: FSMContext):
     user_data = await get_user_data(user_id)
     new_calories = user_data["logged_calories"] + calories
     await update_user_data(user_id, logged_calories=new_calories)
+    user_data["logged_calories"] = new_calories
+    await save_daily_history(user_id, user_data)
     await state.clear()
 
     remaining = max(
@@ -646,6 +826,8 @@ async def cmd_log_workout(message: Message):
 
     new_burned = user_data["burned_calories"] + calories
     await update_user_data(user_id, burned_calories=new_burned)
+    user_data["burned_calories"] = new_burned
+    await save_daily_history(user_id, user_data)
 
     await message.answer(
         f"""{workout_emoji} {workout_name.capitalize()} {duration} мин - {calories:.0f} ккал
@@ -763,6 +945,47 @@ async def cmd_recommend(message: Message):
     await message.answer("\n".join(recommendations), parse_mode="Markdown")
 
 
+@router.message(Command("plot"))
+async def cmd_plot(message: Message):
+    user_id = message.from_user.id
+    user_data = await get_user_data(user_id)
+
+    if not is_profile_complete(user_data):
+        await message.answer("Сначала настройте профиль: /set_profile")
+        return
+
+    await save_daily_history(user_id, user_data)
+
+    args = message.text.split()
+    days = 7
+    if len(args) > 1:
+        try:
+            days = int(args[1])
+            if not 1 <= days <= 30:
+                days = 7
+        except ValueError:
+            pass
+
+    await message.answer("Генерирую график...")
+
+    chart_data = await generate_progress_chart(user_id, days)
+
+    if chart_data is None:
+        await message.answer(
+            "Нет данных для построения графика.\n"
+            "Записывайте воду, еду и тренировки, чтобы увидеть прогресс!"
+        )
+        return
+
+    photo = BufferedInputFile(chart_data, filename="progress.png")
+    await message.answer_photo(
+        photo,
+        caption=f"Ваш прогресс за последние {days} дней\n\n"
+        f"Вода и Калории\n"
+        f"Используйте /plot <дни> для другого периода (1-30)",
+    )
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
@@ -772,12 +995,14 @@ async def cmd_help(message: Message):
 /log\\_food <продукт> - записать еду
 /log\\_workout <тип> <мин> - записать тренировку
 /check\\_progress - прогресс
+/plot - графики прогресса
 /recommend - советы
 
 *Примеры:*
 /log\\_water 250
 /log\\_food банан
-/log\\_workout бег 30""",
+/log\\_workout бег 30
+/plot 14""",
         parse_mode="Markdown",
     )
 
@@ -800,6 +1025,7 @@ async def main():
         BotCommand(command="log_food", description="Записать съеденную еду"),
         BotCommand(command="log_workout", description="Записать тренировку"),
         BotCommand(command="check_progress", description="Посмотреть прогресс"),
+        BotCommand(command="plot", description="Графики прогресса"),
         BotCommand(command="recommend", description="Получить рекомендации"),
         BotCommand(command="help", description="Справка по командам"),
     ]

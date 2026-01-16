@@ -3,4 +3,5 @@ aiohttp
 aiohttp-socks
 aiosqlite
 emoji
+matplotlib
 python-dotenv
